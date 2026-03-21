@@ -62,4 +62,25 @@ This ensures a single database call handles both the first-time completion and t
 
 ---
 
+## 🛠️ 4. Debugging & Error Log
+
+During development, we encountered several common issues. Here is how we resolved them:
+
+### ❌ 1. Data Not Persisting (`await db.commit()`)
+- **Problem**: The `POST /toggle` API returned `{"ok": True}`, but the database was still empty.
+- **Cause**: In `SQLAlchemy` async mode, database operations are buffered in the session. You must explicitly **commit** the transaction to write it to disk.
+- **Resolution**: Added `await db.commit()` after every `db.execute()` in the router.
+
+### ❌ 2. Alembic "ModuleNotFoundError: No module named 'app'"
+- **Problem**: Running `alembic revision` failed with an import error.
+- **Cause**: Windows PowerShell doesn't automatically add the current directory to the Python path.
+- **Resolution**: Ran `$env:PYTHONPATH="."` before executing any Alembic commands to tell Python where your code lives.
+
+### ❌ 3. Missing `X-User-ID` Header (401 Unauthorized)
+- **Problem**: Initial `curl` tests failed with a 401 error.
+- **Cause**: This service relies on the **API Gateway** to identify the user. When testing manually, the Gateway isn't there, so we must manually provide the header.
+- **Resolution**: Added `-H "X-User-ID: <UUID>"` to and every manual `curl` request.
+
+---
+
 **Built with resilience for RoadmapHub.** 🚀
