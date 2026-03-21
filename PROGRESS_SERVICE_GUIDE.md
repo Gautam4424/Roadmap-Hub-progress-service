@@ -1,86 +1,150 @@
-# 📈 Progress Service Complete Guide
+# 📈 Progress Service: From Scratch to Advanced Guide
 
-The **Progress Service** is a dedicated microservice responsible for tracking and persisting user learning journeys across different roadmaps.
+Welcome to the definitive guide for the **Progress Service**. This document explains every line of code, the underlying logic, architectural patterns (HLD), and the terminology required to master this microservice.
 
 ---
 
-## 🏗️ 1. Architecture & Flow
+## 🏗️ 1. High-Level Architecture (HLD) & Flow
 
-This service operates on a **Single Responsibility Principle**: it only cares about which user completed which node.
+The **Progress Service** represents the "memory" of a user's learning path. It tracks exactly which nodes (topics) a user has completed in any given roadmap.
 
-### 🔄 Data Flow
-1. **User Toggles Topic**: Frontend sends a `POST /toggle` request to the API Gateway.
-2. **Gateway Enrichment**: Gateway verifies the JWT and injects `X-User-ID` into the request header.
-3. **Progress Tracking**: Progress Service receives the request, identifies the user via the header, and updates the `user_progress` table.
-4. **Event Emission**: The service publishes a `progress_updated` event to **RabbitMQ** to notify other services (e.g., for analytics or notifications).
+### 🔄 End-to-End System Flow Diagram
 
 ```mermaid
-graph LR
-    A[Frontend] -->|Toggle| B[Gateway]
-    B -->|Header Inject| C[Progress Service]
-    C -->|Commit| D[(Progress DB)]
-    C -->|Publish| E[RabbitMQ]
+graph TD
+    A[Frontend: SkillForge] -->|POST /progress/toggle| B[API Gateway]
+    B -->|Verify JWT & Inject X-User-ID| C[Progress Service]
+    C -->|Commit Update| D[(Progress DB)]
+    C -->|Publish Event| E[RabbitMQ: roadmap_events]
+    F[Notification Service] -.->|Subscribe| E
+    G[Leaderboard Service] -.->|Subscribe| E
 ```
+
+### 🗝️ Key Design Decisions:
+1. **Vertical Isolation**: This service uses its own database (`progress_db`). Even if the master `roadmap_db` goes down, user progress is safe.
+2. **Gateway-Injected Identity**: To prevent spoofing, the service **trusts** the `X-User-ID` header, which is strictly managed by our API Gateway.
+3. **Event-Driven**: We don't wait for other services to update. We just fire a "progress_updated" event to RabbitMQ and return success to the user immediately.
 
 ---
 
-## 💻 2. Code Breakdown
+## 🛠️ 2. Terminology & Technology Stack
 
-### 🛠️ Key Files
+| Term | What is it? | Why use it here? |
+| :--- | :--- | :--- |
+| **Aio-Pika** | An async RabbitMQ client. | Allows us to talk to the message broker without blocking the API. |
+| **Upsert (ON CONFLICT)** | A SQL command that updates OR inserts. | Prevents us from needing a "check if exists" query, which doubles speed. |
+| **UUID (Universally Unique ID)** | A 36-character random string. | Much more secure than simple integers (1, 2, 3) because they cannot be guessed. |
+| **Alembic** | Database migration engine. | Tracks the history of our `user_progress` table versions. |
 
-#### `app/models/models.py` (The Tracking Schema)
+---
+
+## 💻 3. Code Breakdown (Line-by-Line)
+
+### 📂 A. Core Configuration (`app/config.py`)
+This file loads our system settings.
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    # The URL to connect to our private PostgreSQL database
+    DATABASE_URL: str 
+    # The URL for our RabbitMQ message broker
+    RABBITMQ_URL: str = "amqp://admin:localdev@localhost:5672/"
+    SERVICE_NAME: str = "progress-service"
+
+    # Tells Python to read from a file named ".env"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+```
+- **`BaseSettings`**: Automatically performs type checking. If `DATABASE_URL` isn't a string, the app won't start.
+
+---
+
+### 🗄️ B. Database Models (`app/models/models.py`)
+This defines our "UserProgress" table schema.
+
 ```python
 class UserProgress(Base):
     __tablename__ = "user_progress"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    user_id: Mapped[uuid.UUID] = mapped_column(...) # Injected from Gateway
-    node_id: Mapped[uuid.UUID] = mapped_column(...) # The specific topic/chapter
-    is_completed: Mapped[bool] = mapped_column(default=True)
-```
-> **Note**: This table uses a `UniqueConstraint` on `(user_id, node_id)` to ensure we never have duplicate progress records for the same topic.
+    
+    # 1. Primary Key
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    # 2. User & Content Identifiers
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    roadmap_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    
+    # 3. Status
+    is_completed: Mapped[bool] = mapped_column(Boolean, default=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-#### `app/routers/progress.py` (The Toggle Logic)
-We use a high-performance **"Upsert"** (Update or Insert) strategy for toggling:
+    # CRITICAL: Ensures a user can only have ONE entry per node
+    __table_args__ = (
+        UniqueConstraint("user_id", "node_id", name="uq_user_node_progress"),
+    )
+```
+- **`UniqueConstraint`**: This is our "Safety Net". It stops the same user from completing the same topic twice and cluttering the DB.
+
+---
+
+### 🛣️ C. The Router Logic (`app/routers/progress.py`)
+This is the heart of the service. Let's look at the **Toggle** logic:
+
 ```python
-stmt = insert(UserProgress).values(...)
-.on_conflict_do_update(
-    index_elements=["user_id", "node_id"],
-    set_={"is_completed": body.completed}
-)
+@router.post("/toggle")
+async def toggle(body: ToggleRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    # 1. Get the user ID from the header (injected by Gateway)
+    user_id = request.headers.get("X-User-ID")
+    
+    # 2. Prepare the UPSERT statement
+    stmt = insert(UserProgress).values(
+        user_id=uuid.UUID(user_id), 
+        node_id=body.node_id,
+        roadmap_id=body.roadmap_id, 
+        is_completed=body.completed
+    ).on_conflict_do_update(
+        index_elements=["user_id", "node_id"], # Where is the conflict?
+        set_={"is_completed": body.completed}  # What should we change?
+    )
+    
+    # 3. Save to DB
+    await db.execute(stmt)
+    await db.commit() # WITHOUT THIS, NOTHING IS SAVED!
+    
+    # 4. Notify other services via RabbitMQ
+    asyncio.create_task(publish_progress_updated(...))
+    
+    return {"ok": True}
 ```
-This ensures a single database call handles both the first-time completion and the un-checking of a topic.
+- **`on_conflict_do_update`**: This is a PostgreSQL superpower. It handles "Check-then-Create" and "Check-then-Update" in **one single trip** to the database.
 
 ---
 
-## ⚡ 3. Technology Terminology
+### 📢 D. Event Broadcasting (`app/events.py`)
+How we tell the world about progress:
 
-| Term | Explanation |
-| :--- | :--- |
-| **Upsert** | A database operation that either inserts a new row or updates an existing one if a conflict occurs. |
-| **X-User-ID** | A custom HTTP header used to pass authenticated user identity between microservices. |
-| **RabbitMQ (aio-pika)** | A message broker that allows services to "broadcast" events without waiting for a response. |
-
----
-
-## 🛠️ 4. Debugging & Error Log
-
-During development, we encountered several common issues. Here is how we resolved them:
-
-### ❌ 1. Data Not Persisting (`await db.commit()`)
-- **Problem**: The `POST /toggle` API returned `{"ok": True}`, but the database was still empty.
-- **Cause**: In `SQLAlchemy` async mode, database operations are buffered in the session. You must explicitly **commit** the transaction to write it to disk.
-- **Resolution**: Added `await db.commit()` after every `db.execute()` in the router.
-
-### ❌ 2. Alembic "ModuleNotFoundError: No module named 'app'"
-- **Problem**: Running `alembic revision` failed with an import error.
-- **Cause**: Windows PowerShell doesn't automatically add the current directory to the Python path.
-- **Resolution**: Ran `$env:PYTHONPATH="."` before executing any Alembic commands to tell Python where your code lives.
-
-### ❌ 3. Missing `X-User-ID` Header (401 Unauthorized)
-- **Problem**: Initial `curl` tests failed with a 401 error.
-- **Cause**: This service relies on the **API Gateway** to identify the user. When testing manually, the Gateway isn't there, so we must manually provide the header.
-- **Resolution**: Added `-H "X-User-ID: <UUID>"` to and every manual `curl` request.
+```python
+async def publish_progress_updated(user_id, node_id, roadmap_id, completed):
+    connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
+    async with connection:
+        channel = await connection.channel()
+        # Declare a TOPIC exchange (allows filtering by other services)
+        exchange = await channel.declare_exchange("roadmap_events", "topic", durable=True)
+        
+        # Publish with a specific routing key
+        await exchange.publish(message, routing_key="user.progress.updated")
+```
+- **`connection`**: Uses `connect_robust` which automatically reconnects if the network blips.
 
 ---
 
-**Built with resilience for RoadmapHub.** 🚀
+## 🛠️ 4. Debugging & Error Log (Experience Shared)
+
+1. **The "Empty DB" Error**: We learned that in Async SQLAlchemy, `execute()` is only half the battle. You **MUST** call `await db.commit()` or the transaction will disappear when the request ends.
+2. **The "Duplicate Key" Panic**: Initially, we didn't have `UniqueConstraint`. This caused users to have multiple rows for one topic. Adding the constraint + `ON CONFLICT` fix this forever.
+3. **Alembic Paths**: On Windows, PowerShell needs `$env:PYTHONPATH="."` or it won't find your `app` folder during migrations.
+
+---
+
+**Built for the future of RoadmapHub.** 🚀
