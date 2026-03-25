@@ -7,6 +7,12 @@ from alembic import context
 from app.models.models import Base
 
 config = context.config
+
+import os
+db_url = os.environ.get("DATABASE_URL")
+if db_url:
+    config.set_main_option("sqlalchemy.url", db_url)
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -28,8 +34,10 @@ def do_run_migrations(connection):
     with context.begin_transaction():
         context.run_migrations()
 
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
 async def run_migrations_online() -> None:
-    connectable = engine_from_config(
+    connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,

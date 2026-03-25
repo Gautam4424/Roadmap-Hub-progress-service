@@ -18,3 +18,14 @@ class UserProgress(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "node_id", name="uq_user_node_progress"),
     )
+
+class Enrollment(Base):
+    __tablename__ = "enrollments"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    roadmap_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    enrolled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "roadmap_id", name="uq_user_roadmap_enrollment"),
+    )
